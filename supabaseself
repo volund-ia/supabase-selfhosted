@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+# supabaseself — CLI para deploy de edge functions e migrations no Supabase self-hosted
+# Uso:
+#   supabaseself functions deploy      [--host HOST] [--key KEY] [--dir DIR]
+#   supabaseself functions logs [FUNC] [--host HOST] [--key KEY]
+#   supabaseself functions set-env K=V [--host HOST] [--key KEY]
+#   supabaseself functions get-env [KEY] [--host HOST] [--key KEY]
+#   supabaseself functions delete-env KEY [--host HOST] [--key KEY]
+#   supabaseself db push               [--host HOST] [--key KEY] [--migrations-dir DIR]
+#   supabaseself db baseline           [--host HOST] [--key KEY] [--migrations-dir DIR]
+#   supabaseself db status             [--host HOST] [--key KEY]
+#   supabaseself db exec ARQUIVO.sql   [--host HOST] [--key KEY] [--ignore-errors]
+#   supabaseself db dump               [--host HOST] [--key KEY] [--output F] [--format plain|custom|tar]
+#                                       [--tables t1,t2] [--schemas s1,s2] [--exclude-tables t1,t2]
+#                                       [--schema-only] [--data-only] [--no-owner] [--no-acl] [--extra-args a1,a2]
+#   supabaseself db dump-test          [--host HOST] [--key KEY]
+#   supabaseself db dump-head ARQUIVO  [--lines N]
+#   supabaseself db dump-tail ARQUIVO  [--lines N]
+#   supabaseself db dump-tables ARQUIVO
+#   supabaseself db dump-grep ARQUIVO --pattern REGEX [--lines N]
+#   supabaseself docker pull-restart SERVICO [--host HOST] [--key KEY]
+#   supabaseself config                 (salva configuração padrão)
+
+set -euo pipefail
+
+CONFIG_FILE="${HOME}/.supabaseself"
+FUNCTIONS_DIR="supabase/functions"
+MIGRATIONS_DIR="supabase/migrations"
+
+# ── Opções (preenchidas por parse_flags) ─────────────────────────────────────
+OUTPUT=""
+FORMAT="plain"
+TABLES=()
+SCHEMAS=()
+EXCLUDE_TABLES=()
+EXTRA_ARGS=()
+SCHEMA_ONLY="false"
+DATA_ONLY="false"
+NO_OWNER="false"
+NO_ACL="false"
+IGNORE_ERRORS="false"
+LINES="100"
+PATTERN=""
+
+# ── Cores ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'
+info()    { echo -e "${BLUE}ℹ${RESET}  $*"; }
+success() { echo -e "${GREEN}✔${RESET}  $*"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $*"; }
+error()   { echo -e "${RED}✖${RESET}  $*" >&2; }
+die()     { error "$*"; exit 1; }
+
+# ── Dependências ──────────────────────────────────────────────────────────────
+for cmd in curl zip jq; do
+  command -v "$cmd" &>/dev/null || die "Dependência não encontrada: $cmd (instale e tente novamente)"
+done
+
+# ── Utilitários ───────────────────────────────────────────────────────────────
+urlencode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+file_size() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || wc -c < "$1" | tr -d ' '
+}
+
+# ── Config ────────────────────────────────────────────────────────────────────
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  cat > "$CONFIG_FILE" <<EOF
+SUPABASESELF_HOST="${SUPABASESELF_HOST:-}"
+SUPABASESELF_KEY="${SUPABASESELF_KEY:-}"
+EOF
+  chmod 600 "$CONFIG_FILE"
+  success "Configuração salva em $CONFIG_FILE"
+}
+
+prompt_if_missing() {
+  local var="$1" label="$2" secret="${3:-false}"
+  if [[ -z "${!var:-}" ]]; then
+    if [[ "$secret" == "true" ]]; then
+      read -rsp "  ${label}: " value; echo
+    else
+      read -rp  "  ${label}: " value
+    fi
+    eval "$var=\"$value\""
+  fi
+}
+
+# ── Flags comuns a todos os comandos ─────────────────────────────────────────
+parse_flags() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)            SUPABASESELF_HOST="$2"; shift 2 ;;
+      --key)              SUPABASESELF_KEY="$2";  shift 2 ;;
+      --dir)               FUNCTIONS_DIR="$2";     shift 2 ;;
+      --migrations-dir)    MIGRATIONS_DIR="$2";    shift 2 ;;
+      --output)            OUTPUT="$2";            shift 2 ;;
+      --format)             FORMAT="$2";           shift 2 ;;
+      --tables)            IFS=',' read -ra TABLES <<< "$2";         shift 2 ;;
+      --schemas)           IFS=',' read -ra SCHEMAS <<< "$2";        shift 2 ;;
+      --exclude-tables)    IFS=',' read -ra EXCLUDE_TABLES <<< "$2"; shift 2 ;;
+      --extra-args)        IFS=',' read -ra EXTRA_ARGS <<< "$2";     shift 2 ;;
+      --schema-only)       SCHEMA_ONLY="true";     shift ;;
+      --data-only)         DATA_ONLY="true";       shift ;;
+      --no-owner)          NO_OWNER="true";        shift ;;
+      --no-acl)            NO_ACL="true";          shift ;;
+      --ignore-errors)     IGNORE_ERRORS="true";   shift ;;
+      --lines)             LINES="$2";             shift 2 ;;
+      --pattern)           PATTERN="$2";           shift 2 ;;
+      *) shift ;;
+    esac
+  done
+}
+
+resolve_credentials() {
+  load_config
+  parse_flags "$@"
+
+  echo -e "\n${BOLD}Credenciais do ambiente self-hosted${RESET}"
+  prompt_if_missing SUPABASESELF_HOST "Host (ex: https://api-pgf.prodesp.sp.gov.br)"
+  prompt_if_missing SUPABASESELF_KEY  "Chave de deploy (DEPLOY_KEY)" true
+
+  # Remove trailing slash
+  SUPABASESELF_HOST="${SUPABASESELF_HOST%/}"
+}
+
+# ── Health check ──────────────────────────────────────────────────────────────
+check_health() {
+  local resp
+  resp=$(curl -sf --max-time 10 "${SUPABASESELF_HOST}/deploy/health" 2>&1) || \
+    die "Não foi possível alcançar o deploy-service em ${SUPABASESELF_HOST}/deploy/health\n       Verifique se o serviço está rodando e o host está correto."
+  info "Deploy service OK — $(echo "$resp" | jq -r '.timestamp' 2>/dev/null || echo 'online')"
+}
+
+# ── Functions deploy ──────────────────────────────────────────────────────────
+cmd_functions_deploy() {
+  resolve_credentials "$@"
+
+  [[ -d "$FUNCTIONS_DIR" ]] || die "Diretório de functions não encontrado: $FUNCTIONS_DIR"
+
+  check_health
+
+  local tmpzip
+  tmpzip="$(mktemp /tmp/supabaseself-functions-XXXXXX).zip"
+  trap 'rm -f "$tmpzip"' EXIT
+
+  info "Empacotando functions de ${FUNCTIONS_DIR}/ ..."
+  (cd "$FUNCTIONS_DIR" && zip -r "$tmpzip" . -x "*.DS_Store" -x "__MACOSX/*" -x "*.git/*") \
+    || die "Falha ao criar zip"
+
+  local size
+  size=$(du -sh "$tmpzip" | cut -f1)
+  info "Bundle gerado: ${size}"
+
+  info "Enviando para ${SUPABASESELF_HOST}/deploy/functions ..."
+  local resp
+  resp=$(curl -sf --max-time 120 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    -F "bundle=@${tmpzip};type=application/zip" \
+    "${SUPABASESELF_HOST}/deploy/functions") || \
+    die "Falha no deploy. Resposta:\n$(curl -s --max-time 30 \
+      -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+      -F "bundle=@${tmpzip};type=application/zip" \
+      "${SUPABASESELF_HOST}/deploy/functions")"
+
+  local files container
+  files=$(echo "$resp" | jq -r '.files // "?"')
+  container=$(echo "$resp" | jq -r '.container // "?"')
+
+  rm -f "$tmpzip"
+  trap - EXIT
+  success "Deploy concluído! ${files} arquivos extraídos. Container '${container}' reiniciado."
+}
+
+# ── Functions logs (stream) ───────────────────────────────────────────────────
+cmd_functions_logs() {
+  resolve_credentials "$@"
+  check_health
+
+  local func="${ARG1:-}" qs="" stream_uri got_any=false
+  [[ -n "$func" ]] && qs="?func=$(urlencode "$func")"
+  stream_uri="${SUPABASESELF_HOST}/deploy/functions/logs/stream${qs}"
+
+  if [[ -n "$func" ]]; then
+    info "Logs de \"$func\" em tempo real. Ctrl+C para parar."
+  else
+    info "Logs de todas as functions. Ctrl+C para parar."
+  fi
+  echo ""
+
+  while IFS= read -r raw; do
+    got_any=true
+    if [[ "$raw" == *"stream ended"* ]]; then
+      break
+    fi
+    [[ "$raw" == data:\ * ]] || continue
+    local payload="${raw#data: }"
+    local msg
+    msg=$(jq -rn --argjson v "$payload" '$v' 2>/dev/null || true)
+    [[ -n "$msg" ]] && echo "$msg"
+  done < <(curl -N -sS --max-time 0 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" "$stream_uri" 2>/dev/null)
+
+  if [[ "$got_any" == false ]]; then
+    warn "Stream indisponível. Buscando últimas 200 linhas..."
+    local resp
+    resp=$(curl -sf --max-time 30 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" "${SUPABASESELF_HOST}/deploy/functions/logs${qs}") || \
+      die "Falha ao buscar logs."
+    info "$(echo "$resp" | jq -r '.count') linha(s):"
+    echo "$resp" | jq -r '.lines[]'
+  fi
+}
+
+# ── Functions env ─────────────────────────────────────────────────────────────
+cmd_functions_set_env() {
+  resolve_credentials "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe KEY=VALUE. Ex: functions set-env MINHA_VAR=valor"
+  [[ "$ARG1" == *=* ]] || die "Formato inválido. Use KEY=VALUE"
+  check_health
+
+  local body resp
+  body=$(jq -n --arg kv "$ARG1" '{pairs: [$kv]}')
+  resp=$(curl -sf --max-time 30 -X POST \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" -H "Content-Type: application/json" \
+    -d "$body" "${SUPABASESELF_HOST}/deploy/functions/env") || die "Falha ao gravar variável."
+
+  echo "$resp" | jq -r '.changed[]? | "\(.action|ascii_upcase)\t\(.key)"' | \
+    while IFS=$'\t' read -r action key; do success "${action}  ${key}"; done
+  success "Container reiniciado."
+}
+
+cmd_functions_get_env() {
+  resolve_credentials "$@"
+  check_health
+
+  if [[ -n "${ARG1:-}" ]]; then
+    local resp
+    resp=$(curl -sf --max-time 15 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+      "${SUPABASESELF_HOST}/deploy/functions/env/$(urlencode "$ARG1")") || die "Chave não encontrada: $ARG1"
+    echo "$resp" | jq -r '"\(.key)=\(.value)"'
+  else
+    local resp
+    resp=$(curl -sf --max-time 15 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+      "${SUPABASESELF_HOST}/deploy/functions/env") || die "Falha ao consultar variáveis."
+    info "$(echo "$resp" | jq -r '.count') variável(is) — valores mascarados:"
+    echo "$resp" | jq -r '.vars | to_entries | sort_by(.key)[] | "  \(.key)=\(.value)"'
+  fi
+}
+
+cmd_functions_delete_env() {
+  resolve_credentials "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o nome da variável. Ex: functions delete-env MINHA_VAR"
+  check_health
+
+  local resp
+  resp=$(curl -sf --max-time 30 -X DELETE -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    "${SUPABASESELF_HOST}/deploy/functions/env/$(urlencode "$ARG1")") || die "Falha ao remover variável."
+  success "Deletada: $(echo "$resp" | jq -r '.deleted'). Container reiniciado."
+}
+
+# ── DB push ───────────────────────────────────────────────────────────────────
+cmd_db_push() {
+  resolve_credentials "$@"
+
+  [[ -d "$MIGRATIONS_DIR" ]] || die "Diretório de migrations não encontrado: $MIGRATIONS_DIR"
+
+  check_health
+
+  # Busca migrations já aplicadas
+  info "Consultando migrations já aplicadas..."
+  local status_resp
+  status_resp=$(curl -sf --max-time 30 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    "${SUPABASESELF_HOST}/deploy/db/status" 2>/dev/null || echo '{"applied":[]}')
+
+  local applied_names pending_count=0
+  applied_names=$(echo "$status_resp" | jq -r '.applied[].name' 2>/dev/null || echo "")
+
+  while IFS= read -r -d '' file; do
+    local name
+    name=$(basename "$file")
+    if echo "$applied_names" | grep -qx "$name"; then
+      continue
+    fi
+    pending_count=$((pending_count + 1))
+  done < <(find "$MIGRATIONS_DIR" -name "*.sql" -print0 | sort -z)
+
+  if [[ $pending_count -eq 0 ]]; then
+    success "Nenhuma migration pendente. Banco já está atualizado."
+    return 0
+  fi
+
+  info "${pending_count} migration(s) pendente(s). Aplicando..."
+
+  local tmpzip
+  tmpzip=$(mktemp /tmp/supabaseself-migrations-XXXXXX)
+  tmpzip="${tmpzip}.zip"
+  trap 'rm -f "$tmpzip"' EXIT
+
+  (cd "$MIGRATIONS_DIR" && zip -q -r "$tmpzip" . -i "*.sql") || die "Falha ao empacotar migrations"
+
+  local resp
+  resp=$(curl -sf --max-time 300 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    -F "bundle=@${tmpzip};type=application/zip" \
+    "${SUPABASESELF_HOST}/deploy/db/push") || \
+    die "Falha ao aplicar migrations."
+
+  echo ""
+  echo "$resp" | jq -r '.results[] | "\(.status | ascii_upcase)\t\(.name)\(if .error then " — " + .error else "" end)"' | \
+    while IFS=$'\t' read -r status name; do
+      case "$status" in
+        APPLIED)  success "$name" ;;
+        SKIPPED)  warn    "SKIP  $name" ;;
+        ERROR)    error   "$name" ;;
+      esac
+    done
+  echo ""
+
+  local errors
+  errors=$(echo "$resp" | jq '[.results[] | select(.status == "error")] | length')
+  if [[ "$errors" -gt 0 ]]; then
+    die "${errors} migration(s) falharam."
+  fi
+
+  rm -f "$tmpzip"
+  trap - EXIT
+  success "Todas as migrations aplicadas com sucesso."
+}
+
+# ── DB baseline ───────────────────────────────────────────────────────────────
+cmd_db_baseline() {
+  resolve_credentials "$@"
+
+  [[ -d "$MIGRATIONS_DIR" ]] || die "Diretório de migrations não encontrado: $MIGRATIONS_DIR"
+
+  check_health
+
+  warn "BASELINE: marcando todas as migrations como aplicadas SEM executar o SQL."
+  info "Para cancelar, pressione Ctrl+C. Continuando em 3 segundos..."
+  sleep 3
+
+  local tmpzip
+  tmpzip="$(mktemp /tmp/supabaseself-baseline-XXXXXX).zip"
+  trap 'rm -f "$tmpzip"' EXIT
+
+  info "Empacotando migrations..."
+  (cd "$MIGRATIONS_DIR" && zip -q -r "$tmpzip" . -i "*.sql") || die "Falha ao empacotar migrations"
+
+  local resp
+  resp=$(curl -sf --max-time 300 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    -F "bundle=@${tmpzip};type=application/zip" \
+    "${SUPABASESELF_HOST}/deploy/db/baseline") || die "Falha ao gravar baseline."
+
+  rm -f "$tmpzip"
+  trap - EXIT
+  success "Baseline concluído: $(echo "$resp" | jq -r '.marked') marcadas, $(echo "$resp" | jq -r '.skipped') já existiam."
+}
+
+# ── DB status ─────────────────────────────────────────────────────────────────
+cmd_db_status() {
+  resolve_credentials "$@"
+  check_health
+
+  local resp
+  resp=$(curl -sf --max-time 30 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    "${SUPABASESELF_HOST}/deploy/db/status") || die "Falha ao consultar status."
+
+  local total
+  total=$(echo "$resp" | jq '.applied | length')
+  info "${total} migration(s) aplicada(s) no ambiente self-hosted:"
+  echo "$resp" | jq -r '.applied[] | "  \(.applied_at[0:19])  \(.name)"'
+}
+
+# ── DB exec (roda um .sql qualquer, de qualquer tamanho) ─────────────────────
+cmd_db_exec() {
+  resolve_credentials "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o arquivo .sql. Ex: db exec script.sql"
+  [[ -f "$ARG1" ]]      || die "Arquivo não encontrado: $ARG1"
+  check_health
+
+  local qs="" fname fsize
+  [[ "$IGNORE_ERRORS" == "true" ]] && qs="?ignore_errors=1"
+  fname=$(basename "$ARG1")
+  fsize=$(file_size "$ARG1")
+  info "Enviando ${fname} ($((fsize / 1048576)) MB) para execução..."
+
+  local exit_code=""
+  while IFS= read -r raw; do
+    [[ "$raw" == data:\ * ]] || continue
+    local payload="${raw#data: }"
+    if [[ "$payload" == \{* ]]; then
+      local ec
+      ec=$(echo "$payload" | jq -r '.__exit // empty' 2>/dev/null || true)
+      [[ -n "$ec" ]] && exit_code="$ec"
+    else
+      local msg
+      msg=$(jq -rn --argjson v "$payload" '$v' 2>/dev/null || true)
+      [[ -n "$msg" ]] && echo "$msg"
+    fi
+  done < <(curl -N -sS --max-time 0 \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    -F "sql=@${ARG1};filename=${fname};type=text/plain" \
+    "${SUPABASESELF_HOST}/deploy/db/exec${qs}" 2>/dev/null)
+
+  if [[ "$exit_code" == "0" ]]; then
+    success "Execução concluída com sucesso."
+  else
+    die "psql encerrou com código ${exit_code:-desconhecido} (erro ou sinal)."
+  fi
+}
+
+# ── DB dump (gera pg_dump no servidor e baixa) ───────────────────────────────
+cmd_db_dump() {
+  resolve_credentials "$@"
+  check_health
+
+  local tables_json schemas_json exclude_json extra_json body
+  tables_json="[]";  [[ ${#TABLES[@]} -gt 0 ]]         && tables_json=$(printf '%s\n' "${TABLES[@]}" | jq -R . | jq -sc .)
+  schemas_json="[]"; [[ ${#SCHEMAS[@]} -gt 0 ]]        && schemas_json=$(printf '%s\n' "${SCHEMAS[@]}" | jq -R . | jq -sc .)
+  exclude_json="[]"; [[ ${#EXCLUDE_TABLES[@]} -gt 0 ]] && exclude_json=$(printf '%s\n' "${EXCLUDE_TABLES[@]}" | jq -R . | jq -sc .)
+  extra_json="[]";   [[ ${#EXTRA_ARGS[@]} -gt 0 ]]     && extra_json=$(printf '%s\n' "${EXTRA_ARGS[@]}" | jq -R . | jq -sc .)
+
+  body=$(jq -n \
+    --arg format "$FORMAT" \
+    --argjson schemaOnly "$([[ "$SCHEMA_ONLY" == true ]] && echo true || echo false)" \
+    --argjson dataOnly "$([[ "$DATA_ONLY" == true ]] && echo true || echo false)" \
+    --argjson noOwner "$([[ "$NO_OWNER" == true ]] && echo true || echo false)" \
+    --argjson noAcl "$([[ "$NO_ACL" == true ]] && echo true || echo false)" \
+    --argjson tables "$tables_json" \
+    --argjson schemas "$schemas_json" \
+    --argjson excludeTables "$exclude_json" \
+    --argjson extraArgs "$extra_json" \
+    '{format: $format}
+     + (if $schemaOnly then {schema_only:true} else {} end)
+     + (if $dataOnly then {data_only:true} else {} end)
+     + (if $noOwner then {no_owner:true} else {} end)
+     + (if $noAcl then {no_acl:true} else {} end)
+     + (if ($tables|length)>0 then {tables:$tables} else {} end)
+     + (if ($schemas|length)>0 then {schemas:$schemas} else {} end)
+     + (if ($excludeTables|length)>0 then {exclude_tables:$excludeTables} else {} end)
+     + (if ($extraArgs|length)>0 then {extra_args:$extraArgs} else {} end)')
+
+  info "Iniciando dump (formato: $FORMAT)..."
+
+  local job_id="" srv_filename="" srv_size=""
+  while IFS= read -r raw; do
+    [[ "$raw" == data:\ * ]] || continue
+    local payload="${raw#data: }"
+    local status
+    status=$(echo "$payload" | jq -r '.status // empty' 2>/dev/null || true)
+    case "$status" in
+      running)
+        info "$(echo "$payload" | jq -r '.msg // empty')"
+        ;;
+      done)
+        job_id=$(echo "$payload" | jq -r '.jobId')
+        srv_filename=$(echo "$payload" | jq -r '.filename')
+        srv_size=$(echo "$payload" | jq -r '.size')
+        success "pg_dump concluído no servidor ($(awk "BEGIN{printf \"%.2f\", ${srv_size:-0}/1048576}") MB)"
+        ;;
+      error)
+        die "Erro no servidor: $(echo "$payload" | jq -r '.error // empty')"
+        ;;
+    esac
+    [[ -n "$job_id" ]] && break
+  done < <(curl -N -sS -X POST \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" -H "Content-Type: application/json" \
+    -d "$body" "${SUPABASESELF_HOST}/deploy/db/dump" 2>/dev/null)
+
+  [[ -n "$job_id" && "$job_id" != "null" ]] || die "Não foi possível obter jobId do servidor."
+
+  local ext="sql"
+  [[ "$FORMAT" == "custom" ]] && ext="dump"
+  [[ "$FORMAT" == "tar" ]]    && ext="tar"
+  local default_out="dump_$(date +%Y%m%d_%H%M%S).${ext}"
+  local out_file="${OUTPUT:-$default_out}"
+
+  info "Baixando ${srv_filename} -> ${out_file} ..."
+  curl -sf --max-time 0 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" -o "$out_file" \
+    "${SUPABASESELF_HOST}/deploy/db/dump/${job_id}" || die "Falha no download."
+
+  local total
+  total=$(file_size "$out_file")
+  if [[ "${total:-0}" -eq 0 ]]; then
+    rm -f "$out_file"
+    die "Arquivo vazio recebido."
+  fi
+  success "Dump salvo: ${out_file} ($(awk "BEGIN{printf \"%.2f\", ${total}/1048576}") MB)"
+}
+
+cmd_db_dump_test() {
+  resolve_credentials "$@"
+  check_health
+
+  local resp
+  resp=$(curl -sf --max-time 15 -H "X-Deploy-Key: ${SUPABASESELF_KEY}" \
+    "${SUPABASESELF_HOST}/deploy/db/tools") || die "Falha ao consultar ferramentas."
+
+  info "psql:    $(echo "$resp" | jq -r '.psql.out')"
+  info "pg_dump: $(echo "$resp" | jq -r '.pg_dump.out')"
+  if [[ "$(echo "$resp" | jq -r '.db.ok')" == "true" ]]; then
+    success "Conexão DB: OK"
+    echo "  $(echo "$resp" | jq -r '.db.out')"
+  else
+    error "Conexão DB: FALHOU"
+    echo "  $(echo "$resp" | jq -r '.db.err')"
+  fi
+}
+
+# ── db dump-head / dump-tail / dump-tables / dump-grep (locais, sem rede) ────
+cmd_db_dump_head() {
+  parse_flags "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o arquivo. Ex: db dump-head backup.sql"
+  [[ -f "$ARG1" ]]      || die "Arquivo não encontrado: $ARG1"
+
+  info "Primeiras ${LINES} linhas de ${ARG1}"
+  echo ""
+  head -n "$LINES" "$ARG1"
+  echo ""
+  info "$(head -n "$LINES" "$ARG1" | wc -l | tr -d ' ') linha(s) exibida(s)."
+}
+
+cmd_db_dump_tail() {
+  parse_flags "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o arquivo. Ex: db dump-tail backup.sql"
+  [[ -f "$ARG1" ]]      || die "Arquivo não encontrado: $ARG1"
+
+  info "Últimas ${LINES} linhas de ${ARG1}"
+  echo ""
+  tail -n "$LINES" "$ARG1"
+  echo ""
+  info "Fim do arquivo."
+}
+
+cmd_db_dump_tables() {
+  parse_flags "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o arquivo. Ex: db dump-tables backup.sql"
+  [[ -f "$ARG1" ]]      || die "Arquivo não encontrado: $ARG1"
+
+  info "Tabelas encontradas em ${ARG1}:"
+  echo ""
+
+  local out
+  out=$(
+    {
+      grep -E '^[[:space:]]*CREATE[[:space:]]+(UNLOGGED[[:space:]]+)?TABLE[[:space:]]+([A-Za-z0-9_]+\.)?[A-Za-z0-9_]+' "$ARG1" \
+        | sed -E 's/^[[:space:]]*CREATE[[:space:]]+(UNLOGGED[[:space:]]+)?TABLE[[:space:]]+([A-Za-z0-9_]+\.)?([A-Za-z0-9_]+).*/TABLE  \3/'
+      grep -E '^[[:space:]]*COPY[[:space:]]+([A-Za-z0-9_]+\.)?[A-Za-z0-9_]+[[:space:]]*\(' "$ARG1" \
+        | sed -E 's/^[[:space:]]*COPY[[:space:]]+([A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)[[:space:]]*\(.*/DATA   \2/'
+      grep -E '^-- Name:[[:space:]]+[A-Za-z0-9_]+;[[:space:]]+Type:[[:space:]]+(TABLE|SEQUENCE|INDEX|CONSTRAINT|TRIGGER|FUNCTION|VIEW|TYPE)' "$ARG1" \
+        | sed -E 's/^-- Name:[[:space:]]+([A-Za-z0-9_]+);[[:space:]]+Type:[[:space:]]+([A-Za-z0-9_]+).*/\2 \1/' \
+        | awk '{printf "%-12s%s\n", $1, $2}'
+    } | sort -u
+  ) || true
+
+  [[ -n "$out" ]] && echo "$out" | sed 's/^/  /'
+  echo ""
+
+  local count=0
+  [[ -n "$out" ]] && count=$(echo "$out" | wc -l | tr -d ' ')
+  info "${count} objeto(s) encontrado(s)."
+}
+
+cmd_db_dump_grep() {
+  parse_flags "$@"
+  [[ -n "${ARG1:-}" ]]  || die "Informe o arquivo. Ex: db dump-grep backup.sql"
+  [[ -f "$ARG1" ]]       || die "Arquivo não encontrado: $ARG1"
+  [[ -n "$PATTERN" ]]    || die "Informe o padrão. Ex: db dump-grep backup.sql --pattern 'CREATE TABLE'"
+
+  info "Buscando '${PATTERN}' em ${ARG1} (max ${LINES} ocorrências)..."
+  echo ""
+
+  local matches
+  matches=$(grep -n -E "$PATTERN" "$ARG1" 2>/dev/null | head -n "$LINES") || true
+  if [[ -n "$matches" ]]; then
+    while IFS= read -r line; do
+      printf "%8s: %s\n" "${line%%:*}" "${line#*:}"
+    done <<< "$matches"
+  fi
+  echo ""
+
+  local total
+  total=$(grep -c -E "$PATTERN" "$ARG1" 2>/dev/null) || true
+  total="${total:-0}"
+  if [[ "$total" -ge "$LINES" ]]; then
+    warn "Limite de ${LINES} resultados atingido. Use --lines N para mais."
+  else
+    info "${total} ocorrência(s) encontrada(s)."
+  fi
+}
+
+# ── Docker pull-restart ───────────────────────────────────────────────────────
+cmd_docker_pull_restart() {
+  resolve_credentials "$@"
+  [[ -n "${ARG1:-}" ]] || die "Informe o nome do serviço. Ex: docker pull-restart extrato-export-worker"
+  check_health
+
+  local body
+  body=$(jq -n --arg s "$ARG1" '{service: $s}')
+  info "Iniciando docker pull + restart para '${ARG1}'..."
+
+  local exit_code=""
+  while IFS= read -r raw; do
+    [[ "$raw" == data:\ * ]] || continue
+    local payload="${raw#data: }"
+    if [[ "$payload" == \{* ]]; then
+      local ec
+      ec=$(echo "$payload" | jq -r '.__exit // empty' 2>/dev/null || true)
+      [[ -n "$ec" ]] && exit_code="$ec"
+    else
+      local msg
+      msg=$(jq -rn --argjson v "$payload" '$v' 2>/dev/null || true)
+      [[ -n "$msg" ]] && echo "  $msg"
+    fi
+  done < <(curl -N -sS --max-time 0 -X POST \
+    -H "X-Deploy-Key: ${SUPABASESELF_KEY}" -H "Content-Type: application/json" \
+    -d "$body" "${SUPABASESELF_HOST}/deploy/docker/pull-restart" 2>/dev/null)
+
+  if [[ "$exit_code" == "0" ]]; then
+    success "Serviço '${ARG1}' atualizado com sucesso."
+  else
+    die "Falha ao atualizar '${ARG1}'."
+  fi
+}
+
+# ── Config interativo ─────────────────────────────────────────────────────────
+cmd_config() {
+  load_config
+  echo -e "\n${BOLD}Configurar credenciais padrão (salvas em ${CONFIG_FILE})${RESET}"
+  echo -e "${YELLOW}  Deixe em branco para manter o valor atual${RESET}\n"
+
+  local new_host new_key
+  read -rp "  Host atual [${SUPABASESELF_HOST:-não definido}]: " new_host
+  [[ -n "$new_host" ]] && SUPABASESELF_HOST="$new_host"
+
+  read -rsp "  Chave de deploy [${SUPABASESELF_KEY:+******}]: " new_key; echo
+  [[ -n "$new_key" ]] && SUPABASESELF_KEY="$new_key"
+
+  save_config
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+usage() {
+  echo -e "$(cat <<EOF
+
+${BOLD}supabaseself${RESET} — Deploy CLI para Supabase self-hosted
+
+${BOLD}Comandos:${RESET}
+  ${GREEN}functions deploy${RESET}            Empacota supabase/functions/ e deploya no servidor
+  ${GREEN}functions logs [FUNC]${RESET}       Stream de logs em tempo real (sem FUNC = todos)
+  ${GREEN}functions set-env K=V${RESET}       Cria ou altera variável de ambiente
+  ${GREEN}functions get-env [KEY]${RESET}     Lê variável (sem KEY = lista todas mascaradas)
+  ${GREEN}functions delete-env KEY${RESET}    Remove variável de ambiente
+  ${GREEN}db push${RESET}                     Aplica migrations pendentes de supabase/migrations/
+  ${GREEN}db baseline${RESET}                 Marca migrations como aplicadas sem executar SQL
+  ${GREEN}db status${RESET}                   Lista migrations já aplicadas no servidor
+  ${GREEN}db exec ARQUIVO.sql${RESET}         Executa arquivo SQL no banco (qualquer tamanho)
+  ${GREEN}db dump${RESET}                     Gera pg_dump e baixa o arquivo localmente
+  ${GREEN}db dump-test${RESET}                Verifica psql/pg_dump e conexão com o banco
+  ${GREEN}db dump-head ARQUIVO${RESET}        Primeiras N linhas do dump   [--lines N, padrão 100]
+  ${GREEN}db dump-tail ARQUIVO${RESET}        Últimas N linhas do dump     [--lines N, padrão 100]
+  ${GREEN}db dump-tables ARQUIVO${RESET}      Lista tabelas/objetos no dump
+  ${GREEN}db dump-grep ARQUIVO${RESET}        Busca padrão no dump  --pattern "regex" [--lines max]
+  ${GREEN}docker pull-restart SERVICO${RESET} Faz docker compose pull + up -d no serviço informado
+  ${GREEN}config${RESET}                      Salva credenciais padrão em ~/.supabaseself
+
+${BOLD}Opções gerais (qualquer comando):${RESET}
+  --host  HOST            URL base do servidor  (ex: https://api-pgf.prodesp.sp.gov.br)
+  --key   KEY             Chave de deploy       (DEPLOY_KEY do deploy-service)
+  --dir   DIR              Diretório de functions  [padrão: supabase/functions]
+  --migrations-dir DIR     Diretório de migrations [padrão: supabase/migrations]
+  --ignore-errors          (db exec) não para no primeiro erro
+
+${BOLD}Opções de db dump:${RESET}
+  --output ARQUIVO         Nome do arquivo de saída  [padrão: dump_YYYYMMDD_HHmmss.sql]
+  --format plain|custom|tar  Formato do dump          [padrão: plain]
+  --tables t1,t2            Apenas estas tabelas
+  --schemas s1,s2           Apenas estes schemas
+  --exclude-tables t1,t2     Excluir tabelas
+  --schema-only              Só estrutura (sem dados)
+  --data-only                 Só dados (sem estrutura)
+  --no-owner                  Sem comandos ALTER OWNER
+  --no-acl                    Sem comandos GRANT/REVOKE
+  --extra-args a1,a2          Args extras para pg_dump
+
+${BOLD}Exemplos:${RESET}
+  supabaseself config
+  supabaseself functions deploy
+  supabaseself functions logs govbr-auth-url
+  supabaseself functions set-env RESEND_API_KEY=re_abc123
+  supabaseself db push
+  supabaseself db exec correcao.sql
+  supabaseself db dump
+  supabaseself db dump --output backup.sql --no-owner --no-acl
+  supabaseself db dump --format custom --output backup.dump
+  supabaseself db dump --tables users,contracts --schema-only
+  supabaseself db dump-head backup_prod.sql --lines 200
+  supabaseself db dump-tables backup_prod.sql
+  supabaseself db dump-grep backup_prod.sql --pattern "CREATE TABLE.*usuario"
+  supabaseself docker pull-restart extrato-export-worker
+
+EOF
+)"
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+COMMAND="${1:-help}"; [[ $# -gt 0 ]] && shift || true
+SUBCOMMAND="${1:-}";  [[ $# -gt 0 ]] && shift || true
+
+ARG1=""
+if [[ $# -gt 0 && "${1:0:2}" != "--" ]]; then
+  ARG1="$1"; shift
+fi
+
+case "${COMMAND} ${SUBCOMMAND}" in
+  "functions deploy")     cmd_functions_deploy     "$@" ;;
+  "functions logs")       cmd_functions_logs       "$@" ;;
+  "functions set-env")    cmd_functions_set_env    "$@" ;;
+  "functions get-env")    cmd_functions_get_env    "$@" ;;
+  "functions delete-env") cmd_functions_delete_env "$@" ;;
+  "db push")              cmd_db_push              "$@" ;;
+  "db baseline")          cmd_db_baseline          "$@" ;;
+  "db status")            cmd_db_status            "$@" ;;
+  "db exec")              cmd_db_exec              "$@" ;;
+  "db dump")              cmd_db_dump              "$@" ;;
+  "db dump-test")         cmd_db_dump_test         "$@" ;;
+  "db dump-head")         cmd_db_dump_head         "$@" ;;
+  "db dump-tail")         cmd_db_dump_tail         "$@" ;;
+  "db dump-tables")       cmd_db_dump_tables       "$@" ;;
+  "db dump-grep")         cmd_db_dump_grep         "$@" ;;
+  "docker pull-restart")  cmd_docker_pull_restart  "$@" ;;
+  "config ")              cmd_config ;;
+  "config"*)              cmd_config ;;
+  *)                      usage ;;
+esac

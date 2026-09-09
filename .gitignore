@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+
+cert/*.crt
+cert/*.key
+cert/*.pem
+
+volumes/storage/
+volumes/functions/*/
+!volumes/functions/main/
+
+node_modules/
