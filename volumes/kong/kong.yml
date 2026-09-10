@@ -3,12 +3,10 @@ _format_version: "1.1"
 consumers:
   - username: anon
     keyauth_credentials:
-      ## TROCAR pela sua ANON_KEY (gerar com: node scripts/generate-keys.mjs)
-      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg4OTg1NTQ1LCJleHAiOjIxMDQzNDU1NDV9.bZ6rCmYVVL9gGpDK6VSoFH0W6cJugElAPKtVqDYVKKE
   - username: service_role
     keyauth_credentials:
-      ## TROCAR pela sua SERVICE_ROLE_KEY
-      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU
+      - key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3ODg5ODU1NDUsImV4cCI6MjEwNDM0NTU0NX0.Z102uVDVRxSYtGXKcTclQM7j8JuA1q39FIJ-DLK8Ih8
 
 acls:
   - consumer: anon
