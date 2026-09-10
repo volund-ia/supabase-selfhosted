@@ -101,6 +101,11 @@ services:
       - name: key-auth
         config:
           hide_credentials: false
+      - name: request-transformer
+        config:
+          replace:
+            headers:
+              - "host:realtime-dev"
       - name: acl
         config:
           hide_groups_header: true
