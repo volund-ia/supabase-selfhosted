@@ -33,9 +33,9 @@ O `install.sh` e interativo e guia voce por todas as decisoes:
 
 | Etapa | Pergunta | Opcoes |
 |---|---|---|
-| **Modo** | Desenvolvimento ou Producao? | Dev: HTTP + Postgres embarcado. Prod: HTTPS + externo |
+| **Modo** | Desenvolvimento ou Producao? | Dev: HTTP. Prod: HTTPS |
 | **Dominio** | URL da API e do site | Dev: localhost com portas customizaveis |
-| **PostgreSQL** | Embarcado ou externo? | Embarcado: zero config. Externo: host/porta/senha |
+| **PostgreSQL** | Embarcado ou externo? | Ambos os modos permitem escolher. Externo: host/porta/senha |
 | **JWT** | Gerar automaticamente ou informar? | Gera secret + ANON_KEY + SERVICE_ROLE_KEY |
 | **SSL** | Caminhos dos certificados | Aceita Let's Encrypt ou certs customizados |
 | **SMTP** | Configurar envio de e-mails? | Opcional — host, porta, credenciais |
@@ -48,6 +48,7 @@ O `install.sh` e interativo e guia voce por todas as decisoes:
 Escolha: 1 (Desenvolvimento local)
 Porta HTTP do Nginx: 8080
 Porta da API: 8000
+PostgreSQL: 1 (Embarcado no Docker)
 Senha do Postgres: [Enter para "postgres"]
 JWT Secret: 1 (Gerar automaticamente)
 SMTP: n (nao configurar)

@@ -397,6 +397,11 @@ main() {
             "Externo (recomendado para producao)" \
             "Embarcado no Docker"
         [[ $? -eq 1 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
+    else
+        choose "Tipo de PostgreSQL" \
+            "Embarcado no Docker (zero config)" \
+            "Externo (outra VM ou servidor)"
+        [[ $? -eq 0 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
     fi
 
     if $PG_EMBEDDED; then
