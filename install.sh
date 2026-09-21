@@ -100,7 +100,7 @@ check_prereqs() {
     else
         err "docker compose v2 nao encontrado"; fail=true
     fi
-    $fail && { err "Instale os itens acima e execute novamente."; exit 1; }
+    if $fail; then err "Instale os itens acima e execute novamente."; exit 1; fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
