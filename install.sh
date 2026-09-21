@@ -57,15 +57,16 @@ confirm() {
 choose() {
     local prompt="$1"; shift
     local i=1
-    for opt in "$@"; do printf "  %d) %s\n" "$i" "$opt"; ((i++)); done
-    echo
+    for opt in "$@"; do printf "  %d) %s\n" "$i" "$opt" >&2; ((i++)); done
+    echo >&2
     local c
     while true; do
         read -rp "$(printf "  ${W}%s${N}: " "$prompt")" c
         if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= $# )); then
-            return $((c - 1))
+            printf '%d' $((c - 1))
+            return 0
         fi
-        printf "  Escolha entre 1 e %d.\n" "$#"
+        printf "  Escolha entre 1 e %d.\n" "$#" >&2
     done
 }
 
@@ -346,10 +347,10 @@ main() {
 
     # ── 1. Modo ──────────────────────────────────────────────────────────
     step "Modo de instalacao"
-    choose "Escolha" \
+    local MODE
+    MODE=$(choose "Escolha" \
         "Desenvolvimento local (HTTP, banco embarcado)" \
-        "Producao (HTTPS, banco externo recomendado)"
-    local MODE=$?
+        "Producao (HTTPS, banco externo recomendado)")
 
     # Defaults
     PG_HOST="db"; PG_PORT=5432; PG_USER="postgres"; PG_PASS="postgres"; PG_DB="postgres"
@@ -392,16 +393,17 @@ main() {
     # ── 3. PostgreSQL ────────────────────────────────────────────────────
     step "PostgreSQL"
 
+    local PG_CHOICE
     if [[ $MODE -eq 1 ]]; then
-        choose "Tipo de PostgreSQL" \
+        PG_CHOICE=$(choose "Tipo de PostgreSQL" \
             "Externo (recomendado para producao)" \
-            "Embarcado no Docker"
-        [[ $? -eq 1 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
+            "Embarcado no Docker")
+        [[ $PG_CHOICE -eq 1 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
     else
-        choose "Tipo de PostgreSQL" \
+        PG_CHOICE=$(choose "Tipo de PostgreSQL" \
             "Embarcado no Docker (zero config)" \
-            "Externo (outra VM ou servidor)"
-        [[ $? -eq 0 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
+            "Externo (outra VM ou servidor)")
+        [[ $PG_CHOICE -eq 0 ]] && PG_EMBEDDED=true || PG_EMBEDDED=false
     fi
 
     if $PG_EMBEDDED; then
@@ -419,10 +421,11 @@ main() {
 
     # ── 4. JWT ───────────────────────────────────────────────────────────
     step "JWT (JSON Web Tokens)"
-    choose "JWT Secret" \
+    local JWT_CHOICE
+    JWT_CHOICE=$(choose "JWT Secret" \
         "Gerar automaticamente (recomendado)" \
-        "Informar manualmente"
-    if [[ $? -eq 0 ]]; then
+        "Informar manualmente")
+    if [[ $JWT_CHOICE -eq 0 ]]; then
         JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
         ok "JWT Secret gerado (${#JWT_SECRET} caracteres)"
     else
@@ -462,8 +465,9 @@ main() {
     # ── 8. Deploy key ────────────────────────────────────────────────────
     step "Deploy Service"
     if [[ $MODE -eq 1 ]]; then
-        choose "Deploy Key" "Gerar automaticamente" "Informar manualmente"
-        if [[ $? -eq 0 ]]; then
+        local DEPLOY_CHOICE
+        DEPLOY_CHOICE=$(choose "Deploy Key" "Gerar automaticamente" "Informar manualmente")
+        if [[ $DEPLOY_CHOICE -eq 0 ]]; then
             DEPLOY_KEY=$(openssl rand -hex 32)
             ok "Deploy Key gerada"
         else
